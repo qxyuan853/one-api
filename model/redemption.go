@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/songquanpeng/one-api/common"
 	"github.com/songquanpeng/one-api/common/helper"
@@ -66,21 +67,42 @@ func Redeem(ctx context.Context, key string, userId int) (quota int64, err error
 	}
 
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Set("gorm:query_option", "FOR UPDATE").Where(keyCol+" = ?", key).First(redemption).Error
+		// Note: the previous implementation used tx.Set("gorm:query_option", "FOR UPDATE"),
+		// which is the GORM v1 idiom. GORM v2 only stores that key in the statement
+		// settings and emits no locking clause, so no row lock was ever taken: two
+		// concurrent redemptions of the same key both observed status == enabled and both
+		// credited the quota.
+		// SQLite has no FOR UPDATE syntax, so the lock is skipped there; the
+		// compare-and-swap below is what actually makes this safe on every backend.
+		query := tx
+		if !common.UsingSQLite {
+			query = tx.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		err := query.Where(keyCol+" = ?", key).First(redemption).Error
 		if err != nil {
 			return errors.New("无效的兑换码")
 		}
 		if redemption.Status != RedemptionCodeStatusEnabled {
 			return errors.New("该兑换码已被使用")
 		}
-		err = tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error
-		if err != nil {
-			return err
+		// Compare-and-swap on status: only the transaction that actually flips
+		// enabled -> used may credit the quota. This does not rely on SELECT ... FOR
+		// UPDATE being supported, so it also holds on SQLite.
+		result := tx.Model(&Redemption{}).
+			Where("id = ? AND status = ?", redemption.Id, RedemptionCodeStatusEnabled).
+			Updates(map[string]interface{}{
+				"redeemed_time": helper.GetTimestamp(),
+				"status":        RedemptionCodeStatusUsed,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("该兑换码已被使用")
 		}
 		redemption.RedeemedTime = helper.GetTimestamp()
 		redemption.Status = RedemptionCodeStatusUsed
-		err = tx.Save(redemption).Error
-		return err
+		return tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error
 	})
 	if err != nil {
 		return 0, errors.New("兑换失败，" + err.Error())
